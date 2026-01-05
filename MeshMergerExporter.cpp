@@ -22,6 +22,7 @@
 #include "Engine/Texture2D.h"
 #include "Rendering/SkeletalMeshLODImporterData.h"
 #include "Modules/ModuleManager.h"
+#include "TextureResource.h"
 
 AMeshMergerExporter::AMeshMergerExporter()
 {
@@ -176,18 +177,26 @@ FString AMeshMergerExporter::SanitizeFileName(const FString& FileName)
     return Result;
 }
 
-void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& BasePath)
+void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& BasePath, const FString& OBJFileName)
 {
     if (!Mesh) return;
 
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+    // Create Textures folder at the same level as OBJ file
     FString TexturesPath = BasePath + TEXT("/Textures");
-    PlatformFile.CreateDirectoryTree(*TexturesPath);
+    if (!PlatformFile.DirectoryExists(*TexturesPath))
+    {
+        PlatformFile.CreateDirectoryTree(*TexturesPath);
+        UE_LOG(LogTemp, Log, TEXT("Created directory: %s"), *TexturesPath);
+    }
 
     TArray<FStaticMaterial> Materials = Mesh->GetStaticMaterials();
     FString MTLContent;
 
     UE_LOG(LogTemp, Log, TEXT("Exporting %d materials"), Materials.Num());
+    UE_LOG(LogTemp, Log, TEXT("Base path: %s"), *BasePath);
+    UE_LOG(LogTemp, Log, TEXT("Textures path: %s"), *TexturesPath);
 
     for (int32 i = 0; i < Materials.Num(); i++)
     {
@@ -203,10 +212,10 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
 
         // Create MTL file content
         MTLContent += FString::Printf(TEXT("newmtl %s\n"), *MaterialName);
-        MTLContent += TEXT("Ka 1.0 1.0 1.0\n");
-        MTLContent += TEXT("Kd 0.8 0.8 0.8\n");
-        MTLContent += TEXT("Ks 0.5 0.5 0.5\n");
-        MTLContent += TEXT("Ns 32.0\n");
+        MTLContent += TEXT("Ka 1.000 1.000 1.000\n");
+        MTLContent += TEXT("Kd 1.000 1.000 1.000\n");
+        MTLContent += TEXT("Ks 0.000 0.000 0.000\n");
+        MTLContent += TEXT("Ns 10.0\n");
         MTLContent += TEXT("d 1.0\n");
         MTLContent += TEXT("illum 2\n");
 
@@ -247,19 +256,31 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
             }
         }
 
+        bool bTextureExported = false;
+
         if (BaseColorTexture)
         {
             UTexture2D* Texture2D = Cast<UTexture2D>(BaseColorTexture);
             if (Texture2D)
             {
-                // Use PNG format for better compatibility
-                FString TextureName = SanitizeFileName(Texture2D->GetName()) + TEXT(".png");
+                // Check if this is a virtual texture
+                bool bIsVirtualTexture = Texture2D->VirtualTextureStreaming;
+                if (bIsVirtualTexture)
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("Texture %s uses Virtual Texture Streaming - this may cause export issues. Consider disabling VT for this texture."), *Texture2D->GetName());
+                }
+
+                // Try TGA format first (simpler, more compatible)
+                FString TextureName = SanitizeFileName(Texture2D->GetName()) + TEXT(".tga");
                 FString TexturePath = TexturesPath + TEXT("/") + TextureName;
 
-                UE_LOG(LogTemp, Log, TEXT("Attempting to export texture: %s"), *Texture2D->GetName());
+                UE_LOG(LogTemp, Log, TEXT("Attempting to export texture: %s to %s (Virtual Texture: %s)"),
+                    *Texture2D->GetName(), *TexturePath, bIsVirtualTexture ? TEXT("Yes") : TEXT("No"));
 
                 // Get texture source data
                 FTextureSource& TextureSource = Texture2D->Source;
+                bool bUseAlternativeMethod = false;
+
                 if (TextureSource.IsValid())
                 {
                     TArray64<uint8> RawData;
@@ -274,9 +295,9 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
                         UE_LOG(LogTemp, Log, TEXT("Texture size: %dx%d, Format: %d, Data size: %lld"),
                             Width, Height, (int32)Format, RawData.Num());
 
-                        // Convert to RGBA8
-                        TArray<uint8> RGBAData;
-                        RGBAData.SetNum(Width * Height * 4);
+                        // Prepare BGRA data for TGA
+                        TArray<FColor> ColorData;
+                        ColorData.SetNum(Width * Height);
 
                         bool bConversionSuccess = false;
 
@@ -285,42 +306,32 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
                         {
                         case TSF_BGRA8:
                         {
-                            // Convert BGRA to RGBA
+                            // Copy directly as FColor expects BGRA
                             for (int32 PixelIndex = 0; PixelIndex < Width * Height; PixelIndex++)
                             {
-                                int32 SrcIdx = PixelIndex * 4;
-                                int32 DstIdx = PixelIndex * 4;
-                                if (SrcIdx + 3 < RawData.Num())
+                                int32 ByteIndex = PixelIndex * 4;
+                                if (ByteIndex + 3 < RawData.Num())
                                 {
-                                    RGBAData[DstIdx + 0] = RawData[SrcIdx + 2]; // R
-                                    RGBAData[DstIdx + 1] = RawData[SrcIdx + 1]; // G
-                                    RGBAData[DstIdx + 2] = RawData[SrcIdx + 0]; // B
-                                    RGBAData[DstIdx + 3] = RawData[SrcIdx + 3]; // A
+                                    ColorData[PixelIndex] = FColor(
+                                        RawData[ByteIndex + 2], // R (from B position)
+                                        RawData[ByteIndex + 1], // G
+                                        RawData[ByteIndex + 0], // B (from R position)
+                                        RawData[ByteIndex + 3]  // A
+                                    );
                                 }
                             }
                             bConversionSuccess = true;
                             break;
                         }
-                        case TSF_RGBA8:
-                        {
-                            // Already in RGBA format
-                            FMemory::Memcpy(RGBAData.GetData(), RawData.GetData(), FMath::Min(RGBAData.Num(), (int32)RawData.Num()));
-                            bConversionSuccess = true;
-                            break;
-                        }
                         case TSF_G8:
                         {
-                            // Grayscale to RGBA
+                            // Grayscale to BGRA
                             for (int32 PixelIndex = 0; PixelIndex < Width * Height; PixelIndex++)
                             {
                                 if (PixelIndex < RawData.Num())
                                 {
                                     uint8 Gray = RawData[PixelIndex];
-                                    int32 DstIdx = PixelIndex * 4;
-                                    RGBAData[DstIdx + 0] = Gray;
-                                    RGBAData[DstIdx + 1] = Gray;
-                                    RGBAData[DstIdx + 2] = Gray;
-                                    RGBAData[DstIdx + 3] = 255;
+                                    ColorData[PixelIndex] = FColor(Gray, Gray, Gray, 255);
                                 }
                             }
                             bConversionSuccess = true;
@@ -328,54 +339,210 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
                         }
                         default:
                         {
-                            UE_LOG(LogTemp, Warning, TEXT("Unsupported texture format: %d"), (int32)Format);
+                            UE_LOG(LogTemp, Warning, TEXT("Unsupported texture format: %d, trying raw copy"), (int32)Format);
+                            // Try to interpret as BGRA anyway
+                            if (RawData.Num() >= Width * Height * 4)
+                            {
+                                for (int32 PixelIndex = 0; PixelIndex < Width * Height; PixelIndex++)
+                                {
+                                    int32 ByteIndex = PixelIndex * 4;
+                                    ColorData[PixelIndex] = FColor(
+                                        RawData[ByteIndex + 2],
+                                        RawData[ByteIndex + 1],
+                                        RawData[ByteIndex + 0],
+                                        RawData[ByteIndex + 3]
+                                    );
+                                }
+                                bConversionSuccess = true;
+                            }
                             break;
                         }
                         }
 
-                        if (bConversionSuccess)
+                        if (bConversionSuccess && ColorData.Num() > 0)
                         {
-                            // Save as PNG using ImageWrapper
+                            // Try TGA first
                             IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-                            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+                            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::TGA);
 
-                            if (ImageWrapper.IsValid() && ImageWrapper->SetRaw(RGBAData.GetData(), RGBAData.Num(), Width, Height, ERGBFormat::RGBA, 8))
+                            if (ImageWrapper.IsValid())
                             {
-                                const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed(100);
-                                if (CompressedData.Num() > 0)
+                                // TGA expects BGRA format which is what FColor provides
+                                if (ImageWrapper->SetRaw(ColorData.GetData(), ColorData.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
                                 {
-                                    TArray<uint8> Data(CompressedData.GetData(), CompressedData.Num());
-                                    if (FFileHelper::SaveArrayToFile(Data, *TexturePath))
+                                    const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed(100);
+                                    if (CompressedData.Num() > 0)
                                     {
-                                        UE_LOG(LogTemp, Log, TEXT("Successfully exported texture: %s"), *TexturePath);
+                                        TArray<uint8> Data(CompressedData.GetData(), CompressedData.Num());
+                                        if (FFileHelper::SaveArrayToFile(Data, *TexturePath))
+                                        {
+                                            UE_LOG(LogTemp, Log, TEXT("Successfully exported TGA texture: %s (%d bytes)"),
+                                                *TexturePath, Data.Num());
 
-                                        // Use relative path in MTL file (just filename with Textures folder)
-                                        MTLContent += FString::Printf(TEXT("map_Kd Textures/%s\n"), *TextureName);
-                                    }
-                                    else
-                                    {
-                                        UE_LOG(LogTemp, Error, TEXT("Failed to save texture file: %s"), *TexturePath);
+                                            // Use relative path without ./
+                                            MTLContent += FString::Printf(TEXT("map_Kd Textures/%s\n"), *TextureName);
+                                            bTextureExported = true;
+                                        }
+                                        else
+                                        {
+                                            UE_LOG(LogTemp, Error, TEXT("Failed to save TGA file: %s"), *TexturePath);
+                                        }
                                     }
                                 }
-                                else
+                            }
+
+                            // If TGA failed, try BMP (more widely supported)
+                            if (!bTextureExported)
+                            {
+                                TextureName = SanitizeFileName(Texture2D->GetName()) + TEXT(".bmp");
+                                TexturePath = TexturesPath + TEXT("/") + TextureName;
+
+                                ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::BMP);
+                                if (ImageWrapper.IsValid())
                                 {
-                                    UE_LOG(LogTemp, Error, TEXT("Failed to compress texture data"));
+                                    if (ImageWrapper->SetRaw(ColorData.GetData(), ColorData.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+                                    {
+                                        const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed(100);
+                                        if (CompressedData.Num() > 0)
+                                        {
+                                            TArray<uint8> Data(CompressedData.GetData(), CompressedData.Num());
+                                            if (FFileHelper::SaveArrayToFile(Data, *TexturePath))
+                                            {
+                                                UE_LOG(LogTemp, Log, TEXT("Successfully exported BMP texture: %s (%d bytes)"),
+                                                    *TexturePath, Data.Num());
+
+                                                MTLContent += FString::Printf(TEXT("map_Kd Textures/%s\n"), *TextureName);
+                                                bTextureExported = true;
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            else
-                            {
-                                UE_LOG(LogTemp, Error, TEXT("Failed to create image wrapper or set raw data"));
-                            }
+                        }
+                        else
+                        {
+                            UE_LOG(LogTemp, Error, TEXT("Texture conversion failed"));
                         }
                     }
                     else
                     {
-                        UE_LOG(LogTemp, Warning, TEXT("Texture has no mip data"));
+                        UE_LOG(LogTemp, Warning, TEXT("Texture has no mip data, will try alternative method"));
+                        bUseAlternativeMethod = true;
                     }
                 }
                 else
                 {
-                    UE_LOG(LogTemp, Warning, TEXT("Texture source is invalid"));
+                    UE_LOG(LogTemp, Warning, TEXT("Texture source is invalid, will try alternative method"));
+                    bUseAlternativeMethod = true;
+                }
+
+                // Alternative method for Virtual Textures or when source is unavailable
+                if (bUseAlternativeMethod && !bTextureExported)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("Trying to export using alternative method..."));
+
+                    // Try to read texture data from platform data
+                    FTexturePlatformData* PlatformData = Texture2D->GetPlatformData();
+                    if (PlatformData && PlatformData->Mips.Num() > 0)
+                    {
+                        FTexture2DMipMap& Mip = PlatformData->Mips[0];
+                        void* MipData = Mip.BulkData.Lock(LOCK_READ_ONLY);
+
+                        if (MipData)
+                        {
+                            int32 Width = Mip.SizeX;
+                            int32 Height = Mip.SizeY;
+                            int32 DataSize = Mip.BulkData.GetBulkDataSize();
+
+                            UE_LOG(LogTemp, Log, TEXT("Got platform data: %dx%d, %d bytes"),
+                                Width, Height, DataSize);
+
+                            // Assume BGRA8 format for platform data
+                            TArray<FColor> OutBMP;
+                            OutBMP.SetNum(Width * Height);
+
+                            if (DataSize >= Width * Height * 4)
+                            {
+                                uint8* SourceData = static_cast<uint8*>(MipData);
+                                for (int32 PixIdx = 0; PixIdx < Width * Height; PixIdx++)
+                                {
+                                    int32 Idx = PixIdx * 4;
+                                    OutBMP[PixIdx] = FColor(
+                                        SourceData[Idx + 2], // R
+                                        SourceData[Idx + 1], // G
+                                        SourceData[Idx + 0], // B
+                                        SourceData[Idx + 3]  // A
+                                    );
+                                }
+
+                                Mip.BulkData.Unlock();
+
+                                // Try to save as TGA
+                                IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+                                TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::TGA);
+
+                                if (ImageWrapper.IsValid())
+                                {
+                                    if (ImageWrapper->SetRaw(OutBMP.GetData(), OutBMP.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+                                    {
+                                        const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed(100);
+                                        if (CompressedData.Num() > 0)
+                                        {
+                                            FString AltTextureName = SanitizeFileName(Texture2D->GetName()) + TEXT(".tga");
+                                            FString AltTexturePath = TexturesPath + TEXT("/") + AltTextureName;
+
+                                            TArray<uint8> Data(CompressedData.GetData(), CompressedData.Num());
+                                            if (FFileHelper::SaveArrayToFile(Data, *AltTexturePath))
+                                            {
+                                                UE_LOG(LogTemp, Log, TEXT("Successfully exported texture via platform data: %s"), *AltTexturePath);
+                                                MTLContent += FString::Printf(TEXT("map_Kd Textures/%s\n"), *AltTextureName);
+                                                bTextureExported = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // If TGA failed, try BMP
+                                if (!bTextureExported)
+                                {
+                                    FString AltTextureName = SanitizeFileName(Texture2D->GetName()) + TEXT(".bmp");
+                                    FString AltTexturePath = TexturesPath + TEXT("/") + AltTextureName;
+
+                                    ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::BMP);
+                                    if (ImageWrapper.IsValid())
+                                    {
+                                        if (ImageWrapper->SetRaw(OutBMP.GetData(), OutBMP.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+                                        {
+                                            const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed(100);
+                                            if (CompressedData.Num() > 0)
+                                            {
+                                                TArray<uint8> Data(CompressedData.GetData(), CompressedData.Num());
+                                                if (FFileHelper::SaveArrayToFile(Data, *AltTexturePath))
+                                                {
+                                                    UE_LOG(LogTemp, Log, TEXT("Successfully exported BMP via platform data: %s"), *AltTexturePath);
+                                                    MTLContent += FString::Printf(TEXT("map_Kd Textures/%s\n"), *AltTextureName);
+                                                    bTextureExported = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                Mip.BulkData.Unlock();
+                                UE_LOG(LogTemp, Error, TEXT("Platform data size mismatch"));
+                            }
+                        }
+                        else
+                        {
+                            UE_LOG(LogTemp, Error, TEXT("Failed to lock mip data"));
+                        }
+                    }
+                    else
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("No platform data available"));
+                    }
                 }
             }
             else
@@ -388,17 +555,35 @@ void AMeshMergerExporter::ExportMaterials(UStaticMesh* Mesh, const FString& Base
             UE_LOG(LogTemp, Warning, TEXT("No base color texture found for material: %s"), *MaterialName);
         }
 
+        if (!bTextureExported)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("No texture exported for material: %s"), *MaterialName);
+        }
+
         MTLContent += TEXT("\n");
     }
 
-    // Save single MTL file for all materials
-    FString MTLPath = BasePath + TEXT("/") + FPaths::GetBaseFilename(BasePath) + TEXT(".mtl");
+    // Save single MTL file for all materials - use same base name as OBJ file
+    FString MTLFileName = FPaths::GetBaseFilename(OBJFileName) + TEXT(".mtl");
+    FString MTLPath = BasePath + TEXT("/") + MTLFileName;
+
     bool bSaved = FFileHelper::SaveStringToFile(MTLContent, *MTLPath);
-    UE_LOG(LogTemp, Log, TEXT("MTL file saved: %s (Success: %d)"), *MTLPath, bSaved);
+    UE_LOG(LogTemp, Log, TEXT("MTL file saved to: %s (Success: %d)"), *MTLPath, bSaved);
 
     if (bSaved)
     {
-        UE_LOG(LogTemp, Log, TEXT("MTL Content:\n%s"), *MTLContent);
+        UE_LOG(LogTemp, Log, TEXT("=== MTL Content ===\n%s\n=== End MTL ==="), *MTLContent);
+
+        // Verify texture files exist
+        TArray<FString> FoundFiles;
+        IFileManager::Get().FindFiles(FoundFiles, *TexturesPath, TEXT("*.*"));
+        UE_LOG(LogTemp, Log, TEXT("Found %d files in Textures folder:"), FoundFiles.Num());
+        for (const FString& File : FoundFiles)
+        {
+            FString FullPath = TexturesPath + TEXT("/") + File;
+            int64 FileSize = IFileManager::Get().FileSize(*FullPath);
+            UE_LOG(LogTemp, Log, TEXT("  - %s (%lld bytes)"), *File, FileSize);
+        }
     }
 }
 
@@ -544,7 +729,8 @@ bool AMeshMergerExporter::ExportToOBJ(UStaticMesh* Mesh, const FString& FilePath
 
         // Export materials and textures
         FString BasePath = FPaths::GetPath(FilePath);
-        ExportMaterials(Mesh, BasePath);
+        FString OBJFileName = FPaths::GetCleanFilename(FilePath);
+        ExportMaterials(Mesh, BasePath, OBJFileName);
     }
     else
     {
